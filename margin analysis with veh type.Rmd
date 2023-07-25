@@ -1,0 +1,114 @@
+```{r}
+# analysis on number_of_days_after_lane_bidding_launched vs avg_number_of_bids 
+# avg_number_of_bids = total bids / tot requirements 
+# max case of  client_listing_id = 64354f6810b86a001a8c3926
+#
+library(RPostgres)
+
+get_data <- function() {
+  # PostgreSQL connection details
+  POSTGRES_ADDRESS <- "34.93.156.162"
+  POSTGRES_PORT <- "5432"
+  POSTGRES_DBNAME <- "warehouse"
+  POSTGRES_USERNAME <- "prod_wh"
+  POSTGRES_PASSWORD <- "warehouse"
+  
+  # Create the connection string
+  postgres_str <- paste0("postgresql://", POSTGRES_USERNAME, ":", POSTGRES_PASSWORD, "@", POSTGRES_ADDRESS, ":", POSTGRES_PORT, "/", POSTGRES_DBNAME)
+  
+  # Create the PostgreSQL connection
+  con <- dbConnect(RPostgres::Postgres(), dbname = POSTGRES_DBNAME, host = POSTGRES_ADDRESS, port = POSTGRES_PORT, user = POSTGRES_USERNAME, password = POSTGRES_PASSWORD)
+  
+  # SQL query to retrieve data
+  query <- "
+with
+focl as 
+(
+select _id , lane_source , lane_destination  ,client_vertical_name ,vehicle_type_display_name ,city, number_of_bids , vehicles_required ,  number_of_bids / vehicles_required as bids_per_veh_reqd, distance  
+from field_ops_client_listing focl 
+where bid_flag = true  and vehicles_required > 0  and date(created_at) < '2023-06-26' and upper(lane_source) like '%%UDHAM%%' 
+),
+fob_city as 
+(
+select city_code , count(distinct final_driver_owner_contact) as city_partners , count(distinct used_vehicle_number) as city_unique_vehicles 
+from field_ops_booking fob 
+where is_ent_od = true and trip_mode = 'upcountry' and booking_year = 2023
+group by 1
+),
+fob_bid as 
+(
+select city_code , count(distinct final_driver_owner_contact) as bid_case_city_partners , count(distinct used_vehicle_number) as bid_case_city_unique_vehicles 
+from field_ops_booking fob 
+where is_ent_od = true and trip_mode = 'upcountry' and bid_flag = true 
+group by 1
+),
+focl_partners as 
+(
+select vehicle_type_display_name  , lane_source , lane_destination  , count(distinct partner_id) as lc_partners 
+from field_ops_client_listing focl left join 
+(select client_listing_id,partner_id from fieldops_marketplace_quote fmq where bid_flag = true ) fmq on focl._id = fmq.client_listing_id where  bid_flag = true and vehicles_required > 0 group by 1,2,3
+),
+unique_partners_listing_level as 
+(
+select client_listing_id , count(distinct partner_id) as unique_partners_listing_level from fieldops_marketplace_quote fmq where bid_flag = true 
+group by 1 
+),
+fob as 
+(
+select client_listing_id , sum(final_estimated_price) as revenue , sum(final_provisional_cost) as cost , round(100*(sum(final_estimated_price) - sum(final_provisional_cost))/sum(final_estimated_price),2) as margin 
+from field_ops_booking fob 
+where bid_flag = true and is_ent_od = true and final_unfulfilled = 0 and is_active = true and trip_mode = 'upcountry' 
+group by 1
+having sum(final_estimated_price) > 0 and sum(final_provisional_cost) > 0 
+)
+select focl.* , fob_city.city_partners, fob_city.city_unique_vehicles, fob_bid.bid_case_city_partners ,  fob_bid.bid_case_city_unique_vehicles, focl_partners.lc_partners, fob.revenue, fob.cost, fob.margin  , upll.unique_partners_listing_level
+from focl focl left join fob_city fob_city 
+on focl.city = fob_city.city_code
+left join fob_bid fob_bid on 
+fob_bid.city_code = focl.city
+left join focl_partners focl_partners 
+on focl_partners.vehicle_type_display_name = focl.vehicle_type_display_name
+and 
+focl_partners.lane_source = focl.lane_source
+and 
+focl_partners.lane_destination = focl.lane_destination
+left join fob fob on
+fob.client_listing_id  = focl._id
+left join unique_partners_listing_level upll 
+on focl._id = upll.client_listing_id
+  "
+  
+  # Retrieve the data using the connection and query
+  df <- dbGetQuery(con, query)
+  
+  # Close the database connection
+  dbDisconnect(con)
+  
+  return(df)
+}
+
+df1 <- get_data()
+# Assuming you have two data frames df and veh_type
+
+veh_type <- read.csv("veh_type.csv", na.strings = "?", stringsAsFactors = T)
+
+# Perform the merge
+df2 <- merge(df1, veh_type, by = c("client_vertical_name", "vehicle_type_display_name", "city"), all.x = TRUE)
+
+```
+
+
+```{r}
+df = df2[,-c(1,2,3,4,5,6,11,12,13,14,16,7,19)]
+df=as.data.frame(lapply(df, as.numeric))
+lm.fit=lm(margin ~ . , data = df)
+vif(lm.fit)
+```
+
+
+```{r}
+lm.fit = summary(lm(tot_bids/requirements ~ number_of_days_after_lane_bidding_launched, data = df1))
+ggplot(df1, aes(x = number_of_days_after_lane_bidding_launched , y = tot_bids/requirements )) +   geom_point() + geom_abline(intercept = coef(lm.fit)[1], slope = coef(lm.fit)[2], col = "deepskyblue3", size = 1) + 
+    geom_smooth(se = FALSE)
+```
+
